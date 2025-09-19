@@ -1,11 +1,11 @@
-# V-System–Style Vascular Dataset Generator
+# V-System Vascular Network Dataset Generator
 
-Synthetic **vascular volumes + graph metadata** generator inspired by
-[psweens/V-Systems](https://github.com/psweens/V-Systems), built for training and benchmarking
-**skeletonization / centreline** models.
+Synthetic **vascular volumes + centre-line skeletons + graph metadata** generator inspired by
+[psweens/V-System](https://github.com/psweens/V-System), built for training and benchmarking
+**skeletonization / centre-line** prediction models.
 
 This implementation produces per-sample folders with:
-- **Volumes** in **Zarr**, **NIfTI**, or **TIFF slices** for both *vessels* and *centreline*
+- **Volumes** in **Zarr**, **NIfTI**, or **TIFF slices** for both *vessels* and *centre-line*
 - **Graph CSVs**: nodes, edges, per-edge samples, branches, adjacency
 - Metadata-rich folder names that encode shape/format/pixel size/seed/etc.
 
@@ -30,3 +30,4 @@ This implementation produces per-sample folders with:
 ![Binary Centreline.](figure/skel2.png)
 
 *Figure: Example output of binary volume and paired centre-line skeleton in sparse/thick vascular parametrisation.*
+
