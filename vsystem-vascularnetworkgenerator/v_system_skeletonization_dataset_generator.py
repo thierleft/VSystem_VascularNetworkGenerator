@@ -25,6 +25,9 @@ import argparse
 import csv
 import math
 import os
+import gc
+import shutil
+import time
 from dataclasses import dataclass, asdict
 import concurrent.futures as cf
 from typing import List, Tuple, Dict, Optional
@@ -350,29 +353,46 @@ class SpatialHash3D:
                     for rec in self.grid.get((kx+dx, ky+dy, kz+dz), []):
                         yield rec
 
+def _clearance_threshold(r: float, nr: float, *,
+                         mode: str, cf: float,
+                         cap: Optional[float],
+                         surface: float) -> float:
+    if mode == 'min':
+        base = min(r, nr) * cf
+    elif mode == 'geom':
+        base = math.sqrt(max(r, 0.0) * max(nr, 0.0)) * cf
+    else:  # 'sum'
+        base = (r + nr) * cf
+    if cap is not None:
+        base = min(base, cap)
+    return base + surface
+
 def segment_is_clear(p0: np.ndarray, p1: np.ndarray, r0: float, r1: float,
-                     sh: SpatialHash3D, clearance_factor: float,
-                     samples: int = 8, skip_t_head: float = 0.15,
-                     surface_clearance: float = 2.0) -> bool:
+                     sh: SpatialHash3D, params: 'GrowthParams',
+                     samples: int = 8) -> bool:
     """
     Return True if the segment p0->p1 is collision-free.
-    - skip_t_head: fraction of the segment near the start to ignore
-    - surface_clearance: required surface-to-surface spacing in voxels (default 2.0)
-      Collision if dist(centerlines) <= (r + nr) * clearance_factor + surface_clearance
     """
     if samples < 1:
         samples = 1
+    skip = float(params.skip_t_head)
     for i in range(samples + 1):
-        t = skip_t_head + (1.0 - skip_t_head) * (i / float(samples))
-        x = float(p0[0] + t * (p1[0]-p0[0]))
-        y = float(p0[1] + t * (p1[1]-p0[1]))
-        z = float(p0[2] + t * (p1[2]-p0[2]))
+        t = skip + (1.0 - skip) * (i / float(samples))
+        x = float(p0[0] + t * (p1[0] - p0[0]))
+        y = float(p0[1] + t * (p1[1] - p0[1]))
+        z = float(p0[2] + t * (p1[2] - p0[2]))
         r = float(r0 + t * (r1 - r0))
-        search_r = r + surface_clearance + 2.0 * sh.cell
-        for nx, ny, nz, nr in sh.nearby(x,y,z, search_r):
+        search_r = r + params.surface_clearance + 2.0 * sh.cell
+        for nx, ny, nz, nr in sh.nearby(x, y, z, search_r):
             dx = x - nx; dy = y - ny; dz = z - nz
             d2 = dx*dx + dy*dy + dz*dz
-            thresh = (r + nr) * clearance_factor + surface_clearance
+            thresh = _clearance_threshold(
+                r, float(nr),
+                mode=params.clearance_mode,
+                cf=params.clearance_factor,
+                cap=params.clearance_cap,
+                surface=params.surface_clearance
+            )
             if d2 <= (thresh * thresh):
                 return False
     return True
@@ -399,20 +419,33 @@ class GrowthParams:
     samples_per_seg: int = 8                  # centreline samples per logical segment
     seed_points: int = 1                      # number of roots
     boundary_margin: int = 8                  # keep this many voxels inside the volume
-    # Self-avoidance (loose-by-default)
+    # Self-avoidance
     self_avoid: bool = True
     clearance_factor: float = 0.9
     surface_clearance: float = 2.0
     sh_cell: float = 16.0
     max_dir_tries: int = 12
     skip_t_head: float = 0.15
-    # Complexity (0..1) scales density/branching
+    # Tip-hole (omit last samples from spatial hash)
+    avoidance_tip_hole_frac: float = 0.25
+    avoidance_tip_hole_min: int = 4
+    # Complexity (0..1)
     complexity: Optional[float] = None
     # Inward warm-up
     root_inward: bool = False
     first_seg_len: Optional[float] = None
     # Forced branching depth
     force_branch_depth: int = 0
+    # Early-branch control
+    no_branch_before_depth: int = 0
+    early_branch_depth: int = 0
+    early_branch_prob: Optional[float] = None
+    # Clearance shaping
+    clearance_mode: str = "sum"               # 'sum'|'min'|'geom'
+    clearance_cap: Optional[float] = None
+    # Wall avoidance
+    wall_clearance: float = 1.0               # min gap between vessel surface and walls (voxels)
+    max_wall_avoid_bend_deg: float = 45.0     # max allowed bend when avoiding walls
 
 def build_samples(raw_polyline: np.ndarray, params: GrowthParams, rng: np.random.Generator) -> np.ndarray:
     if not params.curved:
@@ -424,19 +457,51 @@ def build_samples(raw_polyline: np.ndarray, params: GrowthParams, rng: np.random
         p0, p1 = raw_polyline[0], raw_polyline[-1]
         dirv = unit(p1 - p0)
         u, v, _ = orthonormal_basis(dirv)
-        bend_axis = u if rng.uniform() < 0.5 else v
-        bend_mag = rng.uniform(0.2, 0.6) * np.linalg.norm(p1 - p0)
+        bend_axis = u if np.random.rand() < 0.5 else v
+        bend_mag = np.random.uniform(0.2, 0.6) * np.linalg.norm(p1 - p0)
         c = (p0 + p1) * 0.5 + bend_axis * bend_mag
         return quadratic_bezier(p0, p1, c, max(2, params.samples_per_seg)).astype(np.float32)
 
     # default Catmull-Rom through 3 jittered points
     p0, p1 = raw_polyline[0], raw_polyline[-1]
     mid = (p0 + p1) / 2.0
-    jitter = random_unit_vector(rng) * rng.uniform(0.2, 0.6) * np.linalg.norm(p1 - p0)
+    jitter = random_unit_vector(np.random.default_rng()) * np.random.uniform(0.2, 0.6) * np.linalg.norm(p1 - p0)
     pts = np.stack([p0, mid + jitter, p1], axis=0)
     return catmull_rom_spline(pts, max(2, params.samples_per_seg)).astype(np.float32)
 
+# ---------------------- NEW: helpers for tip-hole & wall safety --------- #
+def _keep_upto_index(n_samples: int, frac: float, min_tail: int) -> int:
+    """Return exclusive end index for insertion (keep samples[0:idx]). Leaves a 'tip hole'."""
+    hole = max(int(round(n_samples * float(frac))), int(min_tail))
+    return max(0, n_samples - hole)
+
+def _segment_wall_safe(src: np.ndarray, end: np.ndarray, r0: float, r1: float, params: GrowthParams) -> bool:
+    """
+    Approximate test: ensure that along the straight segment, at several points,
+    the vessel surface stays at least wall_clearance away from the walls.
+    """
+    X, Y, Z = params.shape
+    m = params.boundary_margin
+    for t in (0.25, 0.5, 0.75, 1.0):
+        p = src + t * (end - src)
+        r = float(r0 + t * (r1 - r0))
+        mx = min(p[0] - m, (X - m) - p[0])
+        my = min(p[1] - m, (Y - m) - p[1])
+        mz = min(p[2] - m, (Z - m) - p[2])
+        if min(mx, my, mz) < (r + params.wall_clearance):
+            return False
+    return True
+
+def _angle_deg(a: np.ndarray, b: np.ndarray) -> float:
+    a = unit(a); b = unit(b)
+    d = float(np.clip(np.dot(a, b), -1.0, 1.0))
+    return math.degrees(math.acos(d))
+
 def generate_graph(params: GrowthParams, rng: np.random.Generator) -> VascularGraph:
+    """
+    Grow a vascular graph inside a box using randomized tip-extension with optional curvature,
+    tapering, self-avoidance, and branching subject to Murray's law.
+    """
     X, Y, Z = params.shape
     graph = VascularGraph()
 
@@ -458,7 +523,7 @@ def generate_graph(params: GrowthParams, rng: np.random.Generator) -> VascularGr
         roots.append(nid)
     graph.roots = roots
 
-    # Tips, with depth tracking
+    # Tips, with depth tracking (depth = number of accepted extension steps from root)
     tips: List[Tuple[int, np.ndarray]] = []
     tip_depth: Dict[int, int] = {}
 
@@ -475,19 +540,16 @@ def generate_graph(params: GrowthParams, rng: np.random.Generator) -> VascularGr
             end[2] = np.clip(end[2], params.boundary_margin, Z - params.boundary_margin)
             r_start = graph.nodes[nid].radius
             r_end = r_start * params.taper_factor
-            # Accept warm-up without checks (it's inward & bounded)
             raw = np.stack([src, end], axis=0)
             samples = build_samples(raw, params, rng)
             radii = np.linspace(r_start, r_end, len(samples)).astype(np.float32)
             end_id = graph.add_node(end, radius=r_end)
             graph.add_edge(nid, end_id, samples=samples.tolist(), radii=radii.tolist())
-            # Insert only up to near the tip to avoid immediate self-collision
-            if len(samples) > 2:
-                sh.insert_polyline(samples[:-2], radii[:-2])
-            else:
-                sh.insert_polyline(samples, radii)
+            k = _keep_upto_index(len(samples), params.avoidance_tip_hole_frac, params.avoidance_tip_hole_min)
+            if k > 0:
+                sh.insert_polyline(samples[:k], radii[:k])
             tips.append((end_id, dir0))
-            tip_depth[end_id] = 0
+            tip_depth[end_id] = 1
         else:
             dir0 = random_unit_vector(rng); dir0[2] = abs(dir0[2]); dir0 = unit(dir0)
             tips.append((nid, dir0))
@@ -500,11 +562,9 @@ def generate_graph(params: GrowthParams, rng: np.random.Generator) -> VascularGr
         samples = build_samples(raw, params, rng)
         radii = np.linspace(r_start, r_end, len(samples)).astype(np.float32)
         graph.add_edge(start_id, end_id, samples=samples.tolist(), radii=radii.tolist())
-        # Avoid immediate self-collision at tip
-        if len(samples) > 2:
-            sh.insert_polyline(samples[:-2], radii[:-2])
-        else:
-            sh.insert_polyline(samples, radii)
+        k = _keep_upto_index(len(samples), params.avoidance_tip_hole_frac, params.avoidance_tip_hole_min)
+        if k > 0:
+            sh.insert_polyline(samples[:k], radii[:k])
         return end_id, direction
 
     segments_created = 0
@@ -522,37 +582,53 @@ def generate_graph(params: GrowthParams, rng: np.random.Generator) -> VascularGr
             if diam < min_stop:
                 continue
 
-            # try to find a collision-free segment
+            # try to find a collision-free + wall-safe segment
             attempt = 0
             accepted = False
             chosen_end = None
-            chosen_dir = direction
+            base_dir = np.array(direction, dtype=np.float32)
+            chosen_dir = base_dir
             while attempt < params.max_dir_tries and not accepted:
                 seg_len = rng.uniform(params.min_seg_len, params.max_seg_len)
                 test_dir = rotate_towards(chosen_dir, math.radians(params.tip_perturb_angle_deg), rng)
                 end = src + unit(test_dir) * seg_len
-                # clamp within bounds
                 end[0] = np.clip(end[0], params.boundary_margin, X - params.boundary_margin)
                 end[1] = np.clip(end[1], params.boundary_margin, Y - params.boundary_margin)
                 end[2] = np.clip(end[2], params.boundary_margin, Z - params.boundary_margin)
-                if (not params.self_avoid) or segment_is_clear(
-                        src, end, radius, radius * params.taper_factor, sh,
-                        params.clearance_factor, params.samples_per_seg,
-                        params.skip_t_head, params.surface_clearance):
+
+                wall_ok = _segment_wall_safe(src, end, radius, radius * params.taper_factor, params)
+                avoid_ok = (not params.self_avoid) or segment_is_clear(
+                    src, end, radius, radius * params.taper_factor, sh,
+                    params, samples=params.samples_per_seg)
+
+                if wall_ok and avoid_ok:
                     accepted = True
                     chosen_end = end
                     chosen_dir = unit(test_dir)
                     break
+
+                # if avoiding a wall would require too much bend, stop this tip
+                total_bend = _angle_deg(test_dir, base_dir)
+                if (not wall_ok) and (total_bend > params.max_wall_avoid_bend_deg):
+                    accepted = False
+                    break
+
                 attempt += 1
                 chosen_dir = test_dir
+
             if not accepted:
                 continue
 
-            # Force branching for shallow depths
-            force_branch = depth < params.force_branch_depth
-            will_branch = force_branch or (
-                (rng.random() < params.branch_prob) and ((radius * 2.0) > params.min_diam * 1.1)
-            )
+            # --------- Early-branch gating / schedule ----------
+            branching_allowed = (depth >= params.no_branch_before_depth)
+            local_branch_prob = params.branch_prob
+            if (params.early_branch_prob is not None) and (depth < params.early_branch_depth):
+                local_branch_prob = params.early_branch_prob
+            force_branch = branching_allowed and (depth < params.force_branch_depth)
+            can_size_branch = (diam > params.min_diam * 1.1)
+            random_wants_branch = (rng.random() < local_branch_prob)
+            will_branch = force_branch or (branching_allowed and random_wants_branch and can_size_branch)
+            # ---------------------------------------------------
 
             if will_branch:
                 # Two daughters (Murray's law split)
@@ -566,13 +642,13 @@ def generate_graph(params: GrowthParams, rng: np.random.Generator) -> VascularGr
                                                    direction=chosen_dir)
 
                 # Child directions
-                base_dir = chosen_dir
-                u, v, _ = orthonormal_basis(base_dir)
-                a1 = unit(rotate_vector(base_dir, u, math.radians(params.branch_angle_deg)))
-                a2 = unit(rotate_vector(base_dir, v, math.radians(params.branch_angle_deg)))
+                base_dir2 = chosen_dir
+                u, v, _ = orthonormal_basis(base_dir2)
+                a1 = unit(rotate_vector(base_dir2, u, math.radians(params.branch_angle_deg)))
+                a2 = unit(rotate_vector(base_dir2, v, math.radians(params.branch_angle_deg)))
 
                 # Tiny connectors from bifurcation
-                link = 1.0  # ~1 voxel
+                link = 2.0
                 nid1 = graph.add_node(chosen_end + a1 * 1e-3, radius=r1)
                 nid2 = graph.add_node(chosen_end + a2 * 1e-3, radius=r2)
                 for child_id, avec, rr in [(nid1, a1, r1), (nid2, a2, r2)]:
@@ -580,10 +656,9 @@ def generate_graph(params: GrowthParams, rng: np.random.Generator) -> VascularGr
                     samples = build_samples(raw, params, rng)
                     radii = np.linspace(radius * params.taper_factor, rr, len(samples)).astype(np.float32)
                     graph.add_edge(bif_id, child_id, samples=samples.tolist(), radii=radii.tolist())
-                    if len(samples) > 2:
-                        sh.insert_polyline(samples[:-2], radii[:-2])
-                    else:
-                        sh.insert_polyline(samples, radii)
+                    k = _keep_upto_index(len(samples), params.avoidance_tip_hole_frac, params.avoidance_tip_hole_min)
+                    if k > 0:
+                        sh.insert_polyline(samples[:k], radii[:k])
 
                 new_tips.append((nid1, a1))
                 new_tips.append((nid2, a2))
@@ -591,7 +666,7 @@ def generate_graph(params: GrowthParams, rng: np.random.Generator) -> VascularGr
                 new_depths[nid2] = depth + 1
                 segments_created += 1
             else:
-                # extension with taper
+                # extension with taper (no split)
                 new_radius = radius * params.taper_factor
                 end_id, chosen_dir = accept_and_record_edge(nid, chosen_end, r_start=radius, r_end=new_radius,
                                                             direction=chosen_dir)
@@ -647,7 +722,6 @@ def compute_strahler_orders(graph: VascularGraph) -> Tuple[Dict[int,int], Dict[i
 
     eorder: Dict[int,int] = {}
     for eid, e in graph.edges.items():
-        # Use downstream node order when possible
         if parents.get(e.end, None) == e.start:
             eorder[eid] = order.get(e.end, 1)
         elif parents.get(e.start, None) == e.end:
@@ -691,6 +765,20 @@ def save_metadata_csv(sample_dir: str, graph: VascularGraph, shape: Tuple[int, i
             path_str = ";".join(str(n) for n in path)
             w.writerow([bid, s, t, path_str])
 
+    endpoints = set()
+    for s, t, _ in graph.branch_endpoints():
+        endpoints.add(s); endpoints.add(t)
+
+    with open(os.path.join(sample_dir, "branch_endpoints.csv"), 'w', newline='') as f:
+        w = csv.writer(f)
+        w.writerow(["node_id", "x", "y", "z", "radius", "diameter", "strahler", "degree"])
+        for nid in sorted(endpoints):
+            node = graph.nodes[nid]
+            x, y, z = node.xyz
+            r = float(node.radius)
+            deg = len(graph.adj.get(nid, []))
+            w.writerow([nid, x, y, z, r, 2.0 * r, node_strahler.get(nid, 1), deg])
+
     with open(os.path.join(sample_dir, "adjacency.csv"), 'w', newline='') as f:
         w = csv.writer(f)
         w.writerow(["node_id", "neighbors"])
@@ -712,6 +800,61 @@ def create_zarr_arrays(sample_dir: str, chunks: Tuple[int, int, int], shape: Tup
                              chunks=(chunks[2], chunks[1], chunks[0]),
                              dtype='u1', compressor=compressor, overwrite=True, fill_value=0)
     return vol, cl
+
+def _memmap_close(mm):
+    try:
+        if hasattr(mm, 'flush'):
+            mm.flush()
+    except Exception:
+        pass
+    try:
+        # numpy.memmap exposes underlying mmap at _mmap on most platforms
+        m = getattr(mm, '_mmap', None)
+        if m is not None:
+            m.close()
+    except Exception:
+        pass
+
+def _finalize_and_cleanup_memmaps(v_mm, c_mm, tmp_dir: str, out_dir: str, pixdim: Tuple[float,float,float], *,
+                                  write_nifti: bool = True, write_tiff: bool = False, Z: Optional[int] = None):
+    # Save images if requested
+    if write_nifti:
+        if nib is None:
+            raise RuntimeError("nibabel is required for NIfTI output.")
+        sx, sy, sz = pixdim
+        aff = np.diag([sx, sy, sz, 1.0]).astype(np.float32)
+        img_v = nib.Nifti1Image(np.asarray(v_mm), affine=aff)
+        img_c = nib.Nifti1Image(np.asarray(c_mm), affine=aff)
+        nib.save(img_v, os.path.join(out_dir, "vessels.nii.gz"))
+        nib.save(img_c, os.path.join(out_dir, "centreline.nii.gz"))
+    if write_tiff:
+        if tifffile is None:
+            raise RuntimeError("tifffile is required for TIFF output.")
+        assert Z is not None
+        vess_dir = os.path.join(out_dir, "tiff", "vessels")
+        cent_dir = os.path.join(out_dir, "tiff", "centreline")
+        ensure_out(vess_dir); ensure_out(cent_dir)
+        for z in range(Z):
+            tifffile.imwrite(os.path.join(vess_dir, f"z{z:05d}.tif"), np.asarray(v_mm[z]))
+            tifffile.imwrite(os.path.join(cent_dir, f"z{z:05d}.tif"), np.asarray(c_mm[z]))
+
+    # Close and drop memmaps before deleting directory
+    try:
+        _memmap_close(v_mm); _memmap_close(c_mm)
+    except Exception:
+        pass
+    try:
+        del v_mm; del c_mm
+    except Exception:
+        pass
+    gc.collect()
+    # Give Windows a beat to release file locks
+    time.sleep(0.05)
+    try:
+        shutil.rmtree(tmp_dir, ignore_errors=False)
+    except Exception:
+        # last resort, try again ignoring errors
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 def create_output_arrays(sample_dir: str, shape: Tuple[int,int,int], chunks: Tuple[int,int,int], fmt: str,
                          pixdim: Tuple[float,float,float]):
@@ -735,53 +878,15 @@ def create_output_arrays(sample_dir: str, shape: Tuple[int,int,int], chunks: Tup
     cl_mm[:] = 0
 
     if fmt == 'nifti':
-        if nib is None:
-            raise RuntimeError("nibabel is required for NIfTI output. Please `pip install nibabel`.")
-        env = {"v": vol_mm, "c": cl_mm, "tmp": tmp_dir, "pix": pixdim, "dir": sample_dir}
         def finalize():
-            sx, sy, sz = env["pix"]
-            aff = np.diag([sx, sy, sz, 1.0]).astype(np.float32)
-            img_v = nib.Nifti1Image(np.asarray(env["v"]), affine=aff)
-            img_c = nib.Nifti1Image(np.asarray(env["c"]), affine=aff)
-            nib.save(img_v, os.path.join(env["dir"], "vessels.nii.gz"))
-            nib.save(img_c, os.path.join(env["dir"], "centreline.nii.gz"))
-            try:
-                env["v"].flush(); env["c"].flush()
-            except Exception:
-                pass
-            try:
-                import gc
-                del env["v"]; del env["c"]
-                gc.collect()
-            except Exception:
-                pass
-            import shutil
-            shutil.rmtree(env["tmp"], ignore_errors=True)
+            _finalize_and_cleanup_memmaps(vol_mm, cl_mm, tmp_dir, sample_dir, pixdim,
+                                          write_nifti=True, write_tiff=False)
         return vol_mm, cl_mm, finalize
 
     if fmt == 'tiff_slices':
-        if tifffile is None:
-            raise RuntimeError("tifffile is required for TIFF output. Please `pip install tifffile`.")
-        vess_dir = os.path.join(sample_dir, "tiff", "vessels")
-        cent_dir = os.path.join(sample_dir, "tiff", "centreline")
-        ensure_out(vess_dir); ensure_out(cent_dir)
-        env = {"v": vol_mm, "c": cl_mm, "tmp": tmp_dir, "Z": Z, "vdir": vess_dir, "cdir": cent_dir}
         def finalize():
-            for z in range(env["Z"]):
-                tifffile.imwrite(os.path.join(env["vdir"], f"z{z:05d}.tif"), np.asarray(env["v"][z]))
-                tifffile.imwrite(os.path.join(env["cdir"], f"z{z:05d}.tif"), np.asarray(env["c"][z]))
-            try:
-                env["v"].flush(); env["c"].flush()
-            except Exception:
-                pass
-            try:
-                import gc
-                del env["v"]; del env["c"]
-                gc.collect()
-            except Exception:
-                pass
-            import shutil
-            shutil.rmtree(env["tmp"], ignore_errors=True)
+            _finalize_and_cleanup_memmaps(vol_mm, cl_mm, tmp_dir, sample_dir, pixdim,
+                                          write_nifti=False, write_tiff=True, Z=Z)
         return vol_mm, cl_mm, finalize
 
     raise ValueError(f"Unknown output format: {fmt}. Choose from 'zarr', 'nifti', 'tiff_slices'.")
@@ -793,6 +898,113 @@ def write_volumes(sample_dir: str, graph: VascularGraph, shape: Tuple[int, int, 
         e = graph.edges[eid]
         paint_edge_to_zarr(vol, cl, e, chunk=(chunks[2], chunks[1], chunks[0]), shape=(shape[0], shape[1], shape[2]))
     finalize()
+
+# ---------------------- Binned NIfTI exports (re-rasterize) ------------- #
+
+def _ceil_div(a: int, b: int) -> int:
+    return (a + b - 1) // b
+
+def _create_binned_nifti_pair(sample_dir: str,
+                              shape_xyz: Tuple[int, int, int],
+                              pixdim_xyz: Tuple[float, float, float],
+                              factor: int):
+    """
+    Create memmaps for a binned (downsampled) NIfTI pair. Returns (vol_mm, cl_mm, finalize_fn).
+    Filenames: vessels_ds{factor}.nii.gz, centreline_ds{factor}.nii.gz
+    """
+    if nib is None:
+        raise RuntimeError("nibabel is required for --binned-export. Please `pip install nibabel`.")
+
+    Xs, Ys, Zs = shape_xyz
+    Z, Y, X = Zs, Ys, Xs  # memory order (Z,Y,X)
+
+    tmp_dir = os.path.join(sample_dir, f"tmp_ds{factor}")
+    ensure_out(tmp_dir)
+    v_path = os.path.join(tmp_dir, 'vessels.dat')
+    c_path = os.path.join(tmp_dir, 'centreline.dat')
+
+    vol_mm = np.memmap(v_path, dtype=np.uint8, mode='w+', shape=(Z, Y, X))
+    cl_mm  = np.memmap(c_path, dtype=np.uint8, mode='w+', shape=(Z, Y, X))
+    vol_mm[:] = 0
+    cl_mm[:]  = 0
+
+    out_v = os.path.join(sample_dir, f"vessels_ds{factor}.nii.gz")
+    out_c = os.path.join(sample_dir, f"centreline_ds{factor}.nii.gz")
+
+    def finalize():
+        nonlocal vol_mm, cl_mm  # <-- important: avoid UnboundLocalError
+        sx, sy, sz = pixdim_xyz
+        aff = np.diag([sx, sy, sz, 1.0]).astype(np.float32)
+
+        # Save while memmaps are still open
+        img_v = nib.Nifti1Image(np.asarray(vol_mm), affine=aff)
+        img_c = nib.Nifti1Image(np.asarray(cl_mm),  affine=aff)
+        nib.save(img_v, out_v)
+        nib.save(img_c, out_c)
+
+        # Close and release file handles
+        try:
+            _memmap_close(vol_mm); _memmap_close(cl_mm)
+        finally:
+            vol_mm = None
+            cl_mm = None
+
+        gc.collect()
+        time.sleep(0.05)  # let Windows release locks
+        try:
+            shutil.rmtree(tmp_dir, ignore_errors=False)
+        except Exception:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    return vol_mm, cl_mm, finalize
+
+
+def write_binned_nifti_exports(sample_dir: str,
+                               graph: VascularGraph,
+                               base_shape: Tuple[int, int, int],    # (X,Y,Z)
+                               base_pixdim: Tuple[float, float, float],
+                               bin_exponents: Optional[List[int]]):
+    """
+    Re-rasterize the graph at powers-of-two downsampled grids and emit NIfTI pairs
+    (vessels + centreline) with topology preserved.
+    Example: bin_exponents=[1,2] -> ds2 and ds4.
+    """
+    if not bin_exponents:
+        return
+
+    X, Y, Z = base_shape
+    sx, sy, sz = base_pixdim
+    exps = sorted(set(int(e) for e in bin_exponents if int(e) > 0))
+    if not exps:
+        return
+
+    for e in exps:
+        s = 1 << e  # factor = 2**e
+        Xs = _ceil_div(X, s)
+        Ys = _ceil_div(Y, s)
+        Zs = _ceil_div(Z, s)
+        pixdim_s = (sx * s, sy * s, sz * s)
+
+        vol, cl, finalize = _create_binned_nifti_pair(sample_dir,
+                                                      (Xs, Ys, Zs),
+                                                      pixdim_s,
+                                                      factor=s)
+
+        # choose a conservative chunk for painting
+        cz = min(128, Zs); cy = min(128, Ys); cx = min(128, Xs)
+
+        # paint each edge at scaled coordinates/radii
+        for eid, eedge in tqdm(list(graph.edges.items()), desc=f"painting ds{s}"):
+            pts = np.asarray(eedge.samples, dtype=np.float32) / float(s)
+            r   = np.asarray(eedge.radii,  dtype=np.float32) / float(s)
+            e_scaled = Edge(id=eid, start=-1, end=-1,
+                            samples=[(float(px), float(py), float(pz)) for (px,py,pz) in pts],
+                            radii=[float(rv) for rv in r])
+            paint_edge_to_zarr(vol, cl, e_scaled,
+                               chunk=(cz, cy, cx),
+                               shape=(Xs, Ys, Zs))
+
+        finalize()
 
 # ------------------------------ CLI / Main ------------------------------ #
 
@@ -820,7 +1032,7 @@ def parse_args():
     p.add_argument('--seeds', type=int, default=1, help='Number of root seeds')
     p.add_argument('--seed', type=int, default=0, help='Random seed (0 means random)')
     p.add_argument('--boundary', type=int, default=8, help='Boundary margin (voxels)')
-    # Self-avoidance (loose-by-default)
+    # Self-avoidance
     p.add_argument('--self-avoid', action='store_true', help='Enable spatial self-avoidance checks')
     p.add_argument('--clearance-factor', type=float, default=0.9, help='Multiplier on (r1+r2) in collision threshold')
     p.add_argument('--surface-clearance', type=float, default=2.0,
@@ -829,6 +1041,21 @@ def parse_args():
     p.add_argument('--max-dir-tries', type=int, default=12, help='Attempts to rotate a tip to avoid collisions')
     p.add_argument('--skip-t-head', type=float, default=0.15,
                    help='Fraction of each new segment to skip at the tip during clearance checks')
+    # Tip-hole tuning
+    p.add_argument('--avoidance-tip-hole-frac', type=float, default=0.25,
+                   help='Fraction of samples at the end of each new edge NOT inserted in the spatial hash (tip-hole).')
+    p.add_argument('--avoidance-tip-hole-min', type=int, default=4,
+                   help='Minimum number of samples to omit at the tip for the tip-hole.')
+    p.add_argument('--clearance-mode', type=str, default='sum',
+                   choices=['sum','min','geom'],
+                   help="Distance basis for avoidance: 'sum'=(r+nr)*cf, 'min'=min(r,nr)*cf, 'geom'=sqrt(r*nr)*cf.")
+    p.add_argument('--clearance-cap', type=float, default=None,
+                   help='Optional cap (voxels) on the clearance term (before adding surface_clearance).')
+    # Wall avoidance
+    p.add_argument('--wall-clearance', type=float, default=1.0,
+                   help='Min gap (voxels) required between vessel surface and box walls along a new segment.')
+    p.add_argument('--max-wall-avoid-bend', type=float, default=45.0,
+                   help='If avoiding a wall would require turning more than this angle (deg), stop the tip.')
     # Complexity control
     p.add_argument('--complexity', type=float, default=None, help='0..1 factor scaling density/branching')
     # Inward warm-up
@@ -842,9 +1069,26 @@ def parse_args():
     # Forced branching
     p.add_argument('--force-branch-depth', type=int, default=0,
                    help='Force branching for tips whose depth from a root is < this value')
+    # Early-branch control
+    p.add_argument('--no-branch-before-depth', type=int, default=0, metavar='K',
+                   help='Forbid any branching while depth < K (counted in accepted segments from the root).')
+    p.add_argument('--early-branch-depth', type=int, default=0, metavar='D',
+                   help='While depth < D, override branch probability with --early-branch-prob (if set). 0 disables.')
+    p.add_argument('--early-branch-prob', type=float, default=None, metavar='P',
+                   help='Branch probability P used while depth < --early-branch-depth. Omit to use normal --branch-prob.')
     # Output formats
-    p.add_argument('--format', type=str, default='zarr', choices=['zarr','nifti','tiff_slices'], help='Output format for volumes')
-    p.add_argument('--pixdim', type=float, nargs=3, metavar=('SX','SY','SZ'), default=[1.0,1.0,1.0], help='Voxel spacing for NIfTI (mm)')
+    p.add_argument('--format', type=str, default='zarr',
+                choices=['zarr','nifti','tiff_slices'],
+                help='Primary output format for volumes')
+    p.add_argument('--also-nifti', action='store_true',
+                help='In addition to --format, also write NIfTI volumes (vessels.nii.gz, centreline.nii.gz).')
+    p.add_argument('--also-tiff-slices', action='store_true',
+                help='In addition to --format, also write TIFF slice stacks (tiff/vessels/, tiff/centreline/).')
+    p.add_argument('--pixdim', type=float, nargs=3, metavar=('SX','SY','SZ'), default=[1.0,1.0,1.0],
+                help='Voxel spacing for NIfTI (mm)')
+    # Binned NIfTI export (powers of 2)
+    p.add_argument('--binned-export', type=int, nargs='*', default=None, metavar='K',
+                help='Export extra NIfTIs downsampled by 2^K (via re-rasterization), e.g. "--binned-export 1 2" for /2 and /4.')
     # Workers
     p.add_argument('--workers', type=int, default=0, help='Worker processes for parallel sample generation (0=auto)')
     return p.parse_args()
@@ -869,21 +1113,40 @@ def build_sample_dir_name(idx: int, params: GrowthParams, fmt: str, pixdim: Tupl
     )
     return name
 
-def _generate_and_write(idx: int, out: str, shape: Tuple[int,int,int], chunks: Tuple[int,int,int], gp_kwargs: dict,
-                        seed: Optional[int], out_format: str, pixdim: Tuple[float,float,float]):
+def _generate_and_write(idx: int, out: str, shape: Tuple[int,int,int], chunks: Tuple[int,int,int],
+                        gp_kwargs: dict, seed: Optional[int], out_format: str,
+                        pixdim: Tuple[float,float,float],
+                        also_nifti: bool, also_tiff_slices: bool,
+                        binned_pows: Optional[List[int]]):
     rng = np.random.default_rng(seed)
     gp = GrowthParams(**gp_kwargs)
-    # Respect explicit min_diam_stop else clamp to min_diam
     gp.min_diam_stop = gp.min_diam if gp.min_diam_stop is None else gp.min_diam_stop
 
-    # Per-sample directory with metadata in name
-    sample_dirname = build_sample_dir_name(idx, gp, out_format, pixdim, seed)
+    # If extras are requested, tag sample dir as "multi" to avoid misleading __fmt- in the name
+    name_fmt = 'multi' if (also_nifti or also_tiff_slices or (binned_pows and len(binned_pows) > 0)) else out_format
+    sample_dirname = build_sample_dir_name(idx, gp, name_fmt, pixdim, seed)
     sample_dir = os.path.join(out, sample_dirname)
     ensure_out(sample_dir)
 
     graph = generate_graph(gp, rng)
     save_metadata_csv(sample_dir, graph, shape)
+
+    # Primary format
     write_volumes(sample_dir, graph, shape, chunks, output_format=out_format, pixdim=pixdim)
+
+    # Extra formats (skip if same as primary)
+    if also_nifti and out_format != 'nifti':
+        write_volumes(sample_dir, graph, shape, chunks, output_format='nifti', pixdim=pixdim)
+    if also_tiff_slices and out_format != 'tiff_slices':
+        write_volumes(sample_dir, graph, shape, chunks, output_format='tiff_slices', pixdim=pixdim)
+
+    # Binned NIfTI exports (topology-preserving re-rasterization)
+    write_binned_nifti_exports(sample_dir,
+                               graph,
+                               base_shape=shape,
+                               base_pixdim=pixdim,
+                               bin_exponents=binned_pows)
+
     return idx
 
 def main():
@@ -916,11 +1179,20 @@ def main():
         sh_cell=float(args.sh_cell),
         max_dir_tries=int(args.max_dir_tries),
         skip_t_head=float(args.skip_t_head),
+        avoidance_tip_hole_frac=float(args.avoidance_tip_hole_frac),
+        avoidance_tip_hole_min=int(args.avoidance_tip_hole_min),
         complexity=args.complexity,
         root_inward=bool(args.root_inward),
         first_seg_len=args.first_seg_len,
         min_diam_stop=args.min_diam_stop,
         force_branch_depth=int(args.force_branch_depth),
+        no_branch_before_depth = int(args.no_branch_before_depth),
+        early_branch_depth=int(args.early_branch_depth),
+        early_branch_prob=(None if args.early_branch_prob is None else float(args.early_branch_prob)),
+        clearance_mode=str(args.clearance_mode),
+        clearance_cap=(None if args.clearance_cap is None else float(args.clearance_cap)),
+        wall_clearance=float(args.wall_clearance),
+        max_wall_avoid_bend_deg=float(args.max_wall_avoid_bend),
     )
 
     # Optional density/complexity scaling
@@ -945,13 +1217,24 @@ def main():
     gp_kwargs = asdict(gp)
     gp_kwargs['shape'] = tuple(gp_kwargs['shape'])
 
+    binned_pows = None if args.binned_export is None else [int(k) for k in args.binned_export]
+
     if workers == 1 or args.num == 1:
         for i in range(args.num):
-            _generate_and_write(i, args.out, shape, chunks, gp_kwargs, seeds[i], args.format, tuple(args.pixdim))
+            _generate_and_write(i, args.out, shape, chunks, gp_kwargs, seeds[i],
+                                args.format, tuple(args.pixdim),
+                                also_nifti=bool(args.also_nifti),
+                                also_tiff_slices=bool(args.also_tiff_slices),
+                                binned_pows=binned_pows)
     else:
         with cf.ProcessPoolExecutor(max_workers=workers) as exe:
-            futs = [exe.submit(_generate_and_write, i, args.out, shape, chunks, gp_kwargs, seeds[i],
-                               args.format, tuple(args.pixdim)) for i in range(args.num)]
+            futs = [
+                exe.submit(_generate_and_write, i, args.out, shape, chunks, gp_kwargs, seeds[i],
+                           args.format, tuple(args.pixdim),
+                           bool(args.also_nifti), bool(args.also_tiff_slices),
+                           binned_pows)
+                for i in range(args.num)
+            ]
             for _ in tqdm(cf.as_completed(futs), total=len(futs), desc='samples'):
                 _.result()
 
